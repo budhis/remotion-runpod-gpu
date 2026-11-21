@@ -10,7 +10,7 @@ test -x /usr/local/bin/render-gpu && echo "render-gpu: ada"
 bash -n /usr/local/bin/render-gpu && echo "render-gpu: sintaks ok"
 test -x /usr/sbin/sshd && echo "sshd: ada"
 test -f /etc/ssh/ssh_host_ed25519_key && echo "host key: ada"
-test -x "$REMOTION_BROWSER_EXECUTABLE" && echo "chrome: ada"
+if [ -n "${REMOTION_BROWSER_EXECUTABLE:-}" ] && [ -x "$REMOTION_BROWSER_EXECUTABLE" ]; then echo "chrome: ada (env)"; else echo "chrome: env kosong, render-gpu yang mencarikan"; fi
 command -v remotion >/dev/null && echo "remotion global: ada"
 
 echo "== paket =="
@@ -37,7 +37,7 @@ const Shot: React.FC = () => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
   const detik = frame / fps;
-  const seg = Math.min(SEGMEN - 1, Math.floor(detik));
+  const seg = Math.min(SEGMEN - 1, Math.floor(detik / (DETIK / SEGMEN)));
   const p = spring({
     frame: frame - seg * (DETIK / SEGMEN) * fps,
     fps,
@@ -94,14 +94,10 @@ STRIM=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,c
 echo "strim: $STRIM"
 echo "ukuran: $(du -h /tmp/durasi30.mp4 | cut -f1)"
 
-# Isi frame tidak boleh hitam total.
-ffmpeg -v error -y -i /tmp/durasi30.mp4 -vf "select=eq(n\,450)" -frames:v 1 /tmp/f450.png
-python3 - <<'PY'
-from PIL import Image
-im = Image.open("/tmp/f450.png").convert("RGB")
-mx = max(e[1] for e in im.getextrema())
-print("frame 450 max:", mx, "ISI" if mx > 40 else "KOSONG")
-assert mx > 40
-PY
+# Isi frame tidak boleh hitam total. Tanpa PIL: pakai signalstats ffmpeg.
+YAVG=$(ffmpeg -hide_banner -i /tmp/durasi30.mp4 -vf "select=eq(n\,450),signalstats,metadata=mode=print:key=lavfi.signalstats.YAVG" -frames:v 1 -f null - 2>&1 | grep -oE 'YAVG=[0-9.]+' | head -1 | cut -d= -f2)
+echo "frame 450 YAVG: ${YAVG:-?} (>10 = berisi)"
+test -n "$YAVG"
+awk -v y="$YAVG" 'BEGIN { exit (y > 10 ? 0 : 1) }'
 
 echo "SEMUA UJI LOLOS"

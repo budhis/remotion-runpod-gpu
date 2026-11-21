@@ -25,6 +25,14 @@ else
   echo "[entrypoint] PUBLIC_KEY kosong — SSH tanpa kunci (pakai web terminal RunPod)"
 fi
 
+# Session SSH tidak selalu mewarisi ENV image; tulis ke profil supaya
+# `render-gpu` dan Remotion menemukan Chrome yang sudah dipanggang.
+if [ -n "${REMOTION_BROWSER_EXECUTABLE:-}" ]; then
+  echo "export REMOTION_BROWSER_EXECUTABLE=\"$REMOTION_BROWSER_EXECUTABLE\"" > /etc/profile.d/remotion.sh
+  grep -q 'profile.d/remotion.sh' /root/.bashrc 2>/dev/null || \
+    echo '[ -f /etc/profile.d/remotion.sh ] && . /etc/profile.d/remotion.sh' >> /root/.bashrc
+fi
+
 mkdir -p /run/sshd
 /usr/sbin/sshd -D -p 22 -e &
 echo "[entrypoint] sshd jalan di port 22"

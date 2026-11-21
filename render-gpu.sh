@@ -35,6 +35,17 @@ shift 3
 
 GL=${RENDER_GL:-swangle}
 
+# Chrome: image ini memanggang headless shell di /opt/chrome. Session SSH kadang
+# tidak mewarisi ENV image (terbukti di pod 21 Nov 2026), jadi cari sendiri kalau
+# variabelnya kosong atau menunjuk berkas yang tidak ada.
+if [ -z "${REMOTION_BROWSER_EXECUTABLE:-}" ] || [ ! -x "${REMOTION_BROWSER_EXECUTABLE}" ]; then
+  CARI=$(find /opt/chrome/.remotion -type f -name chrome-headless-shell 2>/dev/null | head -1)
+  if [ -n "$CARI" ] && [ -x "$CARI" ]; then
+    export REMOTION_BROWSER_EXECUTABLE="$CARI"
+    echo "[render-gpu] chrome: $CARI"
+  fi
+fi
+
 if [ ! -f "$ENTRY" ]; then
   echo "[render-gpu] entry tidak ditemukan: $ENTRY (cwd: $PWD)" >&2
   exit 2
@@ -52,8 +63,15 @@ ARGS=(--gl="$GL")
 echo "[render-gpu] entry=$ENTRY komposisi=$KOMPOSISI keluaran=$KELUARAN gl=$GL"
 
 # Info GPU: menegaskan driver NVIDIA benar-benar sampai ke container.
-if [ "${RENDER_GPU_INFO:-1}" = "1" ] && command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader \
+# nvidia-smi tidak selalu ada di PATH session SSH (ada di /usr/local/nvidia/bin),
+# jadi cari di beberapa lokasi sebelum menyimpulkan GPU tidak ada.
+NVSMI=""
+for c in "$(command -v nvidia-smi 2>/dev/null)" /usr/bin/nvidia-smi /usr/local/nvidia/bin/nvidia-smi; do
+  [ -n "$c" ] && [ -x "$c" ] && { NVSMI="$c"; break; }
+done
+
+if [ "${RENDER_GPU_INFO:-1}" = "1" ] && [ -n "$NVSMI" ]; then
+  "$NVSMI" --query-gpu=name,driver_version,memory.total --format=csv,noheader \
     || echo "[render-gpu] nvidia-smi gagal (render tetap jalan)"
 else
   echo "[render-gpu] nvidia-smi tidak tersedia — render memakai CPU/SwiftShader"
