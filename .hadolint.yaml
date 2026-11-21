@@ -1,0 +1,14 @@
+name: .dockerignore
+ignore:
+  - node_modules
+  - .git
+  - .github
+  - out
+  - '*.mp4'
+  - '*.mov'
+  - '*.mkv'
+  - '*.png'
+  - '*.jpg'
+  - '*.jpeg'
+  - '*.log'
+  - .DS_Store

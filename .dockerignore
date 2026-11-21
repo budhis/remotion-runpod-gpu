@@ -1,0 +1,15 @@
+node_modules
+**/node_modules
+.git
+.github
+out
+out-*
+*.mp4
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.log
+.DS_Store
+README.md
