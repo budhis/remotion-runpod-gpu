@@ -12,6 +12,7 @@ on:
       - 'Dockerfile'
       - 'render-gpu.sh'
       - 'docker-entrypoint.sh'
+      - 'ci-smoke-test.sh'
       - '.dockerignore'
       - '.github/workflows/build-runpod-remotion.yml'
   workflow_dispatch:
@@ -42,9 +43,11 @@ jobs:
           test -f Dockerfile
           test -f render-gpu.sh
           test -f docker-entrypoint.sh
-          chmod +x render-gpu.sh docker-entrypoint.sh
+          test -f ci-smoke-test.sh
+          chmod +x render-gpu.sh docker-entrypoint.sh ci-smoke-test.sh
           bash -n render-gpu.sh
           bash -n docker-entrypoint.sh
+          bash -n ci-smoke-test.sh
           echo "Semua skrip lolos bash -n"
 
       - name: 3. Bebaskan ruang disk GitHub Runner (image CUDA + Chromium besar)
@@ -107,25 +110,17 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
 
-      - name: 9. Uji isi image (build hijau != image bisa dipakai)
+      - name: 9. Uji isi image + render uji (build hijau != image bisa dipakai)
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
           IMG=$(printf '%s\n' "$TAGS" | head -1)
+          chmod +x ci-smoke-test.sh
           echo "Menguji image: $IMG"
-          docker run --rm --entrypoint bash "$IMG" -c '
-            set -e
-            node -v
-            test -x /usr/local/bin/render-gpu && echo "render-gpu: ada"
-            bash -n /usr/local/bin/render-gpu && echo "render-gpu: sintaks ok"
-            test -d /usr/local/share/.remotion || test -d /opt/chrome/.remotion
-            test -x /usr/local/bin/start.sh && echo "entrypoint: ada"
-            test -x /usr/sbin/sshd && echo "sshd: ada"
-            ls /root/.ssh/ssh_host_*_key >/dev/null && echo "host key: ada"
-            cd /workspace/remotion-app
-            node -e "require(\"remotion\"); require(\"@remotion/renderer\"); require(\"@remotion/three\"); require(\"three\"); console.log(\"paket remotion: ok\")"
-          '
+          docker run --rm \
+            -v "$PWD/ci-smoke-test.sh:/tmp/ci-smoke-test.sh:ro" \
+            --entrypoint bash "$IMG" /tmp/ci-smoke-test.sh
 
       - name: 10. Ringkasan Image yang Berhasil Di-publish
         env:

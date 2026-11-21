@@ -7,6 +7,7 @@ Repo ini berisi satu hal: **image Docker GPU yang siap render Remotion di pod Ru
 ├── Dockerfile
 ├── render-gpu.sh                 # → /usr/local/bin/render-gpu
 ├── docker-entrypoint.sh          # → /usr/local/bin/start.sh (sshd + $PUBLIC_KEY)
+├── ci-smoke-test.sh              # dipakai CI: uji isi image + render 5 frame
 ├── .dockerignore
 ├── .hadolint.yaml
 └── .github/
