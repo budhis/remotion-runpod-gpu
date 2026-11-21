@@ -13,6 +13,7 @@ on:
       - 'render-gpu.sh'
       - 'docker-entrypoint.sh'
       - 'ci-smoke-test.sh'
+      - 'ci-durasi30.sh'
       - '.dockerignore'
       - '.github/workflows/build-runpod-remotion.yml'
   workflow_dispatch:
@@ -44,10 +45,12 @@ jobs:
           test -f render-gpu.sh
           test -f docker-entrypoint.sh
           test -f ci-smoke-test.sh
-          chmod +x render-gpu.sh docker-entrypoint.sh ci-smoke-test.sh
+          test -f ci-durasi30.sh
+          chmod +x render-gpu.sh docker-entrypoint.sh ci-smoke-test.sh ci-durasi30.sh
           bash -n render-gpu.sh
           bash -n docker-entrypoint.sh
           bash -n ci-smoke-test.sh
+          bash -n ci-durasi30.sh
           echo "Semua skrip lolos bash -n"
 
       - name: 3. Bebaskan ruang disk GitHub Runner (image CUDA + Chromium besar)
@@ -121,6 +124,17 @@ jobs:
           docker run --rm \
             -v "$PWD/ci-smoke-test.sh:/tmp/ci-smoke-test.sh:ro" \
             --entrypoint bash "$IMG" /tmp/ci-smoke-test.sh
+
+      - name: 9b. Uji render 30 detik (900 frame 1920x1080) di dalam image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          IMG=$(printf '%s\n' "$TAGS" | head -1)
+          chmod +x ci-durasi30.sh
+          docker run --rm --shm-size=2g \
+            -v "$PWD/ci-durasi30.sh:/tmp/ci-durasi30.sh:ro" \
+            --entrypoint bash "$IMG" /tmp/ci-durasi30.sh
 
       - name: 10. Ringkasan Image yang Berhasil Di-publish
         env:
