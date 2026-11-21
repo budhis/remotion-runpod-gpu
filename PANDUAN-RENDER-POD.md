@@ -65,6 +65,36 @@ Hasil: `<proyek>/out-pod/<komposisi>-<tanggal>.mp4`, log di `out-pod/render-pod.
 
 Kalau mau pod-nya dipertahankan untuk debug: `HAPUS_POD=0 ~/render-pod.sh ...`. **Ingat hentikan manual.**
 
+### Cache `node_modules` di network volume
+
+Tambahkan `TARUH_VOLUME=<id-volume>`:
+
+```bash
+TARUH_VOLUME=qbh5x8cmcc ~/render-pod.sh ~/workspace/projects/proyek src/index.tsx MainComp
+```
+
+Cara kerjanya: volume ter-mount di `/workspace`. Script menghitung kunci cache dari sha256 `package-lock.json` (atau `package.json` kalau tak ada lock), lalu:
+
+- cache ada → `CACHE HIT`, untar ±10–20 detik
+- cache tidak ada → `CACHE MISS`, `npm ci`, lalu simpan `node_modules-<kunci>.tar.gz` ke `/workspace/cache/`
+
+Karena `TARUH_VOLUME` diisi, script otomatis menambahkan `--data-center-ids` (default `EU-RO-1`). **Volume hanya bisa dipakai di data center tempat ia dibuat**; pod di DC lain akan ditolak atau tidak mendapat volume.
+
+Hasil uji nyata (22 Nov 2026, RTX 4090 secure, volume `qbh5x8cmcc` di EU-RO-1, proyek 146 paket):
+
+| | Pod 1 | Pod 2 |
+| --- | --- | --- |
+| Pod siap | 1m24s | **18 detik** |
+| Dependensi | `CACHE MISS` + `npm install` | `CACHE HIT` (untar) |
+| Waktu ke `Concurrency 8x` | 2m02s | **56 detik** |
+| Render 150 frame 1080p | 17 dtk | 21 dtk |
+| `YAVG` frame tengah | 32,65 | 32,65 (identik) |
+| Pod setelah selesai | 0 | 0 |
+| Biaya | $0,89/jam × ±2,5 mnt | $0,89/jam × ±1,5 mnt |
+
+Catatan biaya: `pod list` dan saldo tidak bergerak selama uji karena RunPod menagih per jam di akhir — bukan karena pod gratis. Pakai `runpodctl list-pod-billing` atau dashboard untuk angka pastinya.
+
+
 ## 5. Jalur manual (kalau script tidak dipakai)
 
 ```bash
@@ -178,6 +208,8 @@ Build pertama ±8–15 menit; berikutnya 2–6 menit karena cache `type=gha`.
 ## 10. Yang belum teruji
 
 - Render proyek yang butuh paket **di luar** daftar image (mis. `@remotion/whisper-web`, Cesium) — perlu `npm install` di proyek, pasti jalan, tapi belum dicoba.
-- Network volume sebagai cache `node_modules` (`TARUH_VOLUME`) — logikanya sudah ditulis, belum dijalankan end-to-end.
 - Serverless (queue) — image ini untuk **Pod**, bukan endpoint serverless.
 - Pod dengan GPU Blackwell untuk `--gl=angle` — belum dicoba; `swangle` tetap yang dianjurkan.
+- Cache volume saat `package-lock.json` berubah (kunci baru) — logikanya `CACHE MISS` lalu simpan kunci baru, tapi belum dijalankan.
+
+Sudah teruji end-to-end 22 Nov 2026: pembuatan pod dari template, verifikasi image, kirim proyek, `npm ci`, render, tarik hasil, cek hitam, hapus pod — dua kali berturut-turut, keduanya `EXIT=0`, `pod list` kosong, dan cache volume `CACHE MISS` → `CACHE HIT`.
