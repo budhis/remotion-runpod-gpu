@@ -137,7 +137,8 @@ Urutan kerja script:
 3. verifikasi di pod: `node -v`, versi `remotion` proyek, `render-gpu` ada, Chrome ada,
    plus catatan berapa detik pod perlu siap (image pull + boot)
 4. kirim proyek via `tar` lewat SSH — tanpa `node_modules`, `.git`, `out`, video
-5. dependensi: `npm ci`, atau dari cache volume (`CACHE HIT`/`CACHE MISS`)
+5. dependensi: bawaan `npm ci` (±8 dtk di pod); `CACHE_NPM=1` memakai cache volume
+   (lihat bagian 6). `npm ci`, atau dari cache volume (`CACHE HIT`/`CACHE MISS`)
 6. `render-gpu <entry> <komposisi> /root/keluaran/….mp4`
 7. `ffprobe` di pod → tarik hasil → cek `YAVG` frame tengah > 10 (bukan hitam)
 8. **hapus pod** lewat `trap EXIT` — juga saat gagal atau di-Ctrl-C
@@ -152,6 +153,8 @@ Variabel yang bisa diatur:
 | `GPU` | `RTX 4090, A40, L4, RTX 6000 Ada, L40S` | daftar GPU, **dicoba berurutan** (bawaan: termurah dulu) |
 | `GPU_CADANGAN` | (kosong) | ditambahkan sesudah daftar `GPU` kalau semuanya gagal |
 | `CLOUD` | `SECURE` | `SECURE` atau `COMMUNITY` |
+| `CACHE_NPM` | (kosong) | `1` = pakai cache `node_modules` di volume (lihat bagian 6) |
+| `BERSIHKAN_CACHE` | (kosong) | `1` = hapus tar cache di volume sebelum render |
 | `DATA_CENTER` | `EU-RO-1` | dipakai otomatis kalau `TARUH_VOLUME` diisi |
 | `TARUH_VOLUME` | (kosong) | id network volume untuk cache `node_modules` |
 | `HAPUS_POD` | `1` | `0` = pod dibiarkan hidup untuk debug (hentikan manual!) |
@@ -159,24 +162,49 @@ Variabel yang bisa diatur:
 
 ---
 
-## 6. Cache `node_modules` di network volume
+## 6. Cache `node_modules` di network volume (opt-in: `CACHE_NPM=1`)
 
-Teruji 22 Nov 2026. Cara kerjanya:
+Diukur di pod 22 Nov 2026: `npm ci` 242 paket hanya **8 detik** — jaringan pod cepat.
+Menyimpan tar cache 254 MB ke network volume makan **±2 menit** (tar + tulis), sementara
+`CACHE HIT` untar 8 detik. Jadi cache **tidak** dinyalakan sebagai bawaan; menyalakannya
+justru memperlambat render pertama dan hanya menghemat beberapa detik pada render berikutnya.
 
-- volume ter-mount di `/workspace`
-- kunci cache = sha256 `package-lock.json` (atau `package.json` kalau tak ada lock)
-- ada → `CACHE HIT`, untar ±10–20 dtk
-- tidak ada → `CACHE MISS`, `npm ci`, simpan `node_modules-<kunci>.tar.gz` ke `/workspace/cache/`
+Pakai `CACHE_NPM=1` hanya kalau registry npm lambat/terblokir, atau pohon dependensi besar
+(>800 paket) sehingga `npm ci` mencapai menit-an.
 
-| | Pod 1 (`CACHE MISS`) | Pod 2 (`CACHE HIT`) |
-| --- | --- | --- |
-| Pod siap | 1m24s | **18 detik** |
-| Sampai render mulai | 2m02s | **56 detik** |
-| Render 150 frame 1080p | 17 dtk | 21 dtk |
-| `YAVG` frame tengah | 32,65 | 32,65 (identik) |
-| Pod tersisa setelah selesai | 0 | 0 |
+```bash
+# bawaan: npm biasa (tetap memasang volume supaya ada /workspace)
+TARUH_VOLUME=qbh5x8cmcc ./render-pod.sh <proyek> src/index.tsx <Komposisi>
 
-Proyek uji: Remotion 4.0.545, 146 paket, `node_modules` 283 MB → tar 67 MB.
+# dengan cache, kalau memang perlu
+TARUH_VOLUME=qbh5x8cmcc CACHE_NPM=1 ./render-pod.sh <proyek> src/index.tsx <Komposisi>
+# bersihkan tar cache dulu (mengukur CACHE MISS dari nol)
+TARUH_VOLUME=qbh5x8cmcc CACHE_NPM=1 BERSIHKAN_CACHE=1 ./render-pod.sh <proyek> src/index.tsx <Komposisi>
+```
+
+Urutan yang dicoba saat `CACHE_NPM=1` (semuanya tanpa unduhan kalau bisa):
+
+1. `CACHE HIT` — tar `node_modules-<kunci lockfile>.tar.gz` di `/workspace/cache`
+2. `CACHE ISI` — tar lain di `/workspace/cache/isi` dengan kunci isi (hash semua
+   `path@versi`) yang sama
+3. `CACHE COPY` — `node_modules` proyek lain di `/root/kerja-*` yang memuat semua paket
+   non-opsional proyek ini (diverifikasi per paket, bukan per nama folder)
+4. `CACHE MISS` — `npm ci` dengan `_cacache` di volume; paket tersimpan, paket baru diunduh
+
+Setelah pasang, tiap `dependencies`/`devDependencies` dicek ada dan versinya cocok dengan
+lockfile (`CEK OK`). Kalau tidak cocok: npm sekali lagi; masih gagal → skrip berhenti
+dengan `exit 6`, tidak render dengan `node_modules` yang belum pasti.
+
+Hasil uji pod 22 Nov 2026 (proyek `uji-render-pod`, 4 paket tingkat atas, 242 paket,
+`node_modules` 254 MB):
+
+| | A: `CACHE MISS` (cache dibersihkan) | B: `CACHE HIT` | C: `CACHE_NPM=1` setelah perubahan |
+| --- | --- | --- | --- |
+| Pod siap | 78 dtk | – | – |
+| Fase dependensi | npm 8 dtk + simpan ±2 mnt | **untar + cek 5 dtk** | untar + cek 8 dtk |
+| Render 60 frame 1080p | 15 dtk | 23 dtk | 24 dtk |
+| `YAVG` frame tengah | 37,70 | 37,70 | 37,70 |
+| `EXIT` / pod tersisa | 0 / tidak ada | 0 / tidak ada | 0 / tidak ada |
 
 Catatan: `runpodctl user` (saldo) **tidak** bergerak dalam hitungan menit karena RunPod
 menagih per jam. Jangan pakai selisih saldo untuk menakar biaya per render; pakai

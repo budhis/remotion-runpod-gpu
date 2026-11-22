@@ -180,18 +180,154 @@ catat "proyek terkirim"
 # --- 4. dependensi proyek ---
 # node_modules dari image ada di /workspace/remotion-app (paket lengkap), tapi
 # `remotion render` membaca node_modules milik proyek.
-# Dengan TARUH_VOLUME: install sekali, simpan sebagai tar di volume, pod
-# berikutnya cuma untar (~10-20 dtk) alih-alih npm install (1-3 menit).
-# Kunci cache = sha256 package-lock.json (atau package.json kalau tanpa lock).
-if [ -n "${TARUH_VOLUME:-}" ]; then
-  KUNCI_CACHE=$( (cat "$PROYEK/package-lock.json" 2>/dev/null || cat "$PROYEK/package.json") | sha256sum | cut -c1-16)
-  catat "dependensi lewat cache volume (kunci $KUNCI_CACHE)"
-  "${SSH[@]}" "set -e; mkdir -p /workspace/cache; cd $SISI;     if [ -f /workspace/cache/node_modules-$KUNCI_CACHE.tar.gz ]; then       echo 'CACHE HIT'; tar xzf /workspace/cache/node_modules-$KUNCI_CACHE.tar.gz;     else       echo 'CACHE MISS';       if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund --legacy-peer-deps; fi;       tar czf /workspace/cache/node_modules-$KUNCI_CACHE.tar.gz node_modules;       echo 'CACHE DISIMPAN';     fi" 2>&1 | tee -a "$LOG"
-else
-  catat "install dependensi proyek (pertama kali bisa 1-3 menit)"
+#
+# Tanpa TARUH_VOLUME: npm biasa (unduh dari internet).
+# Dengan TARUH_VOLUME, semua usaha diarahkan supaya TIDAK ADA unduhan:
+#   1. CACHE HIT   tar node_modules dengan kunci lockfile yang sama (untar 1-2 dtk)
+#   2. CACHE ISI   tar lain di /workspace/cache/isi yang kuncinya sama
+#   3. CACHE COPY  node_modules proyek lain di /workspace/proyek/<nama> atau
+#                  /root/kerja-* (dipinjam kalau semua paket non-opsional cocok)
+#   4. CACHE MISS  npm dengan _cacache di volume: tarball sudah ada -> tanpa unduh;
+#                  paket baru terunduh sekali, lalu tar + _cacache disimpan
+# Setelah pasang, tiap dependencies/devDependencies dicek ada dan versinya cocok
+# dengan lockfile. Gagal -> npm sekali lagi; tetap gagal -> keluar (jangan render
+# dengan node_modules yang belum pasti).
+# Diukur di pod 22 Nov 2026: `npm ci` 242 paket = 8 dtk (jaringan pod cepat).
+# Menyimpan tar cache 254 MB ke network volume justru makan ~2 menit, jadi cache
+# TIDAK dinyalakan sebagai bawaan. Pakai CACHE_NPM=1 kalau registry lambat atau
+# pohon dependensi besar.
+if [ -z "${TARUH_VOLUME:-}" ] || [ -z "${CACHE_NPM:-}" ]; then
+  catat "install dependensi via npm (bawaan; CACHE_NPM=1 untuk memakai cache volume)"
   "${SSH[@]}" "set -e; cd $SISI;     if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund --legacy-peer-deps; fi" 2>&1 | tee -a "$LOG"
+else
+  LOCK="$PROYEK/package-lock.json"; [ -f "$LOCK" ] || LOCK="$PROYEK/package.json"
+  KUNCI_CACHE=$(sha256sum "$LOCK" | cut -c1-16)
+  KUNCI_ISI=$(python3 - "$PROYEK" <<'PY'
+import json,sys,os,hashlib
+d=sys.argv[1]; lock=os.path.join(d,'package-lock.json'); out=[]
+if os.path.exists(lock):
+    j=json.load(open(lock))
+    for k,v in j.get('packages',{}).items():
+        if not k: continue
+        ver=v.get('version') or (j.get('dependencies',{}).get(v.get('name') or '',{}) or {}).get('version')
+        if ver: out.append(k+'@'+ver)
+else:
+    j=json.load(open(os.path.join(d,'package.json')))
+    for sec in ('dependencies','devDependencies'):
+        for n,v in (j.get(sec) or {}).items(): out.append(n+'@'+v)
+print(hashlib.sha256("\n".join(sorted(set(out))).encode()).hexdigest()[:16])
+PY
+)
+  VERIFIKASI=$(python3 - "$PROYEK" <<'PY'
+import json,sys,os
+d=sys.argv[1]; pj=json.load(open(os.path.join(d,'package.json')))
+lock=os.path.join(d,'package-lock.json'); wajib=set()
+for sec in ('dependencies','devDependencies'): wajib |= set((pj.get(sec) or {}).keys())
+vers={}
+if os.path.exists(lock):
+    j=json.load(open(lock))
+    for k,v in j.get('packages',{}).items():
+        if k: vers[k.split('node_modules/',1)[-1]]=(v or {}).get('version')
+print(" ".join(n+'='+(vers.get(n) or '-') for n in sorted(wajib)))
+PY
+)
+  catat "dependensi lewat volume (kunci lock $KUNCI_CACHE, kunci isi $KUNCI_ISI, paket wajib $(printf '%s' "$VERIFIKASI" | wc -w))"
+  PASANG=$(cat <<'INPOD'
+set -e
+CACHE=/workspace/cache
+export npm_config_cache=$CACHE/npm-cacache
+export npm_config_fetch_retries=5 npm_config_fetch_timeout=300000
+mkdir -p "$CACHE/npm-cacache" "$CACHE/isi"
+@BERSIH@
+BARU=""
+if [ -f "$CACHE/node_modules-@KUNCI_LOCK@.tar.gz" ]; then
+  echo "CACHE HIT (kunci lockfile)"
+  tar xzf "$CACHE/node_modules-@KUNCI_LOCK@.tar.gz"
+elif [ -f "$CACHE/isi/index.tsv" ] && awk -v k=@KUNCI_ISI@ '$1==k{print $2; exit}' "$CACHE/isi/index.tsv" | grep -q .; then
+  NAMATAR=$(awk -v k=@KUNCI_ISI@ '$1==k{print $2; exit}' "$CACHE/isi/index.tsv")
+  echo "CACHE ISI (tar $NAMATAR isinya identik)"
+  tar xzf "$CACHE/isi/$NAMATAR.tar.gz"
+else
+  echo "CACHE MISS (npm, _cacache di volume)"
+  BARU=1
+  for CALON in /workspace/proyek/*/node_modules /root/kerja-*/node_modules; do
+    [ -d "$CALON" ] || continue
+    if node -e '
+const fs=require("fs"),path=require("path");
+const lock=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+const calon=process.argv[2], kurang=[];
+for (const [k,v] of Object.entries(lock.packages||{})) {
+  if (!k || !v.version || v.optional) continue;
+  const p=k.replace(/^node_modules\//,"");
+  let j=null; try{j=JSON.parse(fs.readFileSync(path.join(calon,p,"package.json"),"utf8"))}catch(e){}
+  if (!j || j.version!==v.version) kurang.push(p);
+}
+process.exit(kurang.length?1:0);
+' package-lock.json "$CALON" 2>/dev/null; then
+      echo "CACHE COPY (node_modules proyek lain isinya identik: $CALON)"
+      cp -a "$CALON" node_modules
+      BARU=""
+      break
+    fi
+  done
+  if [ ! -d node_modules ]; then
+    if [ -f package-lock.json ]; then npm ci --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps; else npm install --no-audit --no-fund --legacy-peer-deps; fi
+  fi
 fi
-
+CEK_PAKET() {
+  local hilang="" p v pv
+  for ITEM in @VERIFIKASI@; do
+    p="${ITEM%%=*}"; v="${ITEM#*=}"
+    if [ ! -e "node_modules/$p" ]; then hilang="$hilang $p(hilang)"
+    elif [ "$v" != "-" ]; then
+      pv=$(node -e 'try{console.log(require("./node_modules/"+process.argv[1]+"/package.json").version)}catch(e){console.log("")}' "$p" 2>/dev/null)
+      [ "$pv" = "$v" ] || hilang="$hilang $p(${pv:-?}!=$v)"
+    fi
+  done
+  if [ -n "$hilang" ]; then echo "CEK GAGAL:$hilang"; return 1; fi
+  echo "CEK OK (paket wajib ada, versi cocok)"
+}
+if ! CEK_PAKET; then
+  echo "paket belum cocok — npm sekali lagi (tarball dari _cacache volume)"
+  rm -rf node_modules
+  if [ -f package-lock.json ]; then npm ci --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps; else npm install --no-audit --no-fund --legacy-peer-deps; fi
+  BARU=1
+  CEK_PAKET || { echo "paket tetap tidak cocok — berhenti, jangan render"; exit 6; }
+fi
+if [ -n "$BARU" ]; then
+  tar czf "$CACHE/isi/node_modules-@KUNCI_ISI@.tar.gz" node_modules
+  cp "$CACHE/isi/node_modules-@KUNCI_ISI@.tar.gz" "$CACHE/node_modules-@KUNCI_LOCK@.tar.gz"
+  grep -v "^@KUNCI_ISI@"$'\t' "$CACHE/isi/index.tsv" 2>/dev/null > "$CACHE/isi/index.tmp" || true
+  printf '%s\t%s\n' "@KUNCI_ISI@" "node_modules-@KUNCI_ISI@" >> "$CACHE/isi/index.tmp"
+  mv "$CACHE/isi/index.tmp" "$CACHE/isi/index.tsv"
+  echo "CACHE DISIMPAN"
+fi
+du -sh node_modules
+INPOD
+)
+  PASANG=${PASANG//@KUNCI_LOCK@/$KUNCI_CACHE}
+  PASANG=${PASANG//@KUNCI_ISI@/$KUNCI_ISI}
+  PASANG=${PASANG//@VERIFIKASI@/$VERIFIKASI}
+  PASANG=${PASANG//@NAMA@/$NAMA}
+  BERSIH_CMD=""
+  if [ -n "${BERSIHKAN_CACHE:-}" ]; then
+    BERSIH_CMD='echo "cache volume dibersihkan dulu (BERSIHKAN_CACHE=1)"; rm -rf "$CACHE/isi" "$CACHE"/*.tar.gz; mkdir -p "$CACHE/isi"'
+    catat "BERSIHKAN_CACHE=1: tar cache di volume dihapus sebelum render"
+  fi
+  PASANG=${PASANG//@BERSIH@/$BERSIH_CMD}
+  # simulasi lokal (uji di mesin ini tanpa pod): volume → folder, isi kerja → /tmp/sim2/kerja
+  if [ -n "${SIMULASI_LOKAL:-}" ]; then
+    PASANG=${PASANG//\/workspace\/cache/$SIMULASI_LOKAL}
+    PASANG=${PASANG//\/workspace\/proyek/$SIMULASI_LOKAL/proyek}
+  fi
+  PASANG="cd $SISI
+$PASANG"
+  if [ -n "${SIMULASI_LOKAL:-}" ]; then
+    bash -c "$PASANG" 2>&1 | tee -a "$LOG"
+  else
+    "${SSH[@]}" "$PASANG" 2>&1 | tee -a "$LOG"
+  fi
+fi
 # --- 5. render ---
 KELUARAN="/root/keluaran/$(basename "$KOMPOSISI")-$(date +%Y%m%d-%H%M).mp4"
 catat "render $KOMPOSISI -> $KELUARAN"
