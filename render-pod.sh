@@ -15,9 +15,10 @@
 #
 # Env opsional:
 #   TEMPLATE_ID   default 2r4zu7wvgp
-#   GPU           default "NVIDIA GeForce RTX 4090" (murah + stok Medium di EU-RO-1)
+#   GPU           daftar GPU dipisah koma, DICOBA BERURUTAN sesuai prioritas
+#                 (default: dari yang paling murah, lihat DEFAULT_GPU di bawah)
 #   DATA_CENTER   default EU-RO-1 (lokasi network volume; pod harus se-DC dengan volume)
-#   GPU_CADANGAN  daftar dipisah koma kalau GPU utama habis
+#   GPU_CADANGAN  ditambahkan SESUDAH daftar GPU kalau semua di GPU gagal
 #   CLOUD         SECURE | COMMUNITY     (default SECURE)
 #   TARUH_VOLUME  id network volume untuk cache node_modules (opsional).
 #                 Volume ter-mount di /workspace bawaan RunPod. Jangan ubah ke
@@ -33,9 +34,13 @@ KOMPOSISI=${3:?komposisi, mis. MainComp}
 PROYEK=$(cd "$PROYEK" && pwd)
 
 TEMPLATE_ID=${TEMPLATE_ID:-2r4zu7wvgp}
-GPU=${GPU:-"NVIDIA GeForce RTX 4090"}
+# Urutan bawaan = dari yang paling murah menurut harga GLOBAL (secure, 22 Nov 2026:
+# A40 $0,59 · L4 $0,69 · 4090 $0,89 · L40S $1,09 · RTX 6000 Ada $1,09).
+# Dengan TARUH_VOLUME (EU-RO-1) harga per GPU beda — urutan lokal ada di panduan bagian 3.
+DEFAULT_GPU="NVIDIA GeForce RTX 4090,NVIDIA A40,NVIDIA L4,NVIDIA RTX 6000 Ada Generation,NVIDIA L40S"
+GPU=${GPU:-"$DEFAULT_GPU"}
 DATA_CENTER=${DATA_CENTER:-EU-RO-1}
-GPU_CADANGAN=${GPU_CADANGAN:-"NVIDIA L4,NVIDIA GeForce RTX 5090,NVIDIA RTX 6000 Ada Generation"}
+GPU_CADANGAN=${GPU_CADANGAN:-""}
 CLOUD=${CLOUD:-SECURE}
 HAPUS_POD=${HAPUS_POD:-1}
 KUNCI="$HOME/.runpod/ssh/runpodctl-ssh-key"
@@ -85,20 +90,37 @@ if [ -n "${TARUH_VOLUME:-}" ]; then
   catat "volume cache $TARUH_VOLUME dipasang di $DATA_CENTER"
 fi
 
-catat "membuat pod dari template $TEMPLATE_ID (GPU $GPU, cloud $CLOUD)"
 BISA=0
-for G in "$GPU" $(printf '%s' "$GPU_CADANGAN" | tr ',' ' '); do
+# GPU (urutan prioritas) lalu GPU_CADANGAN (cadangan terakhir). Harga tidak
+# disortir otomatis, jadi urutan daftar = urutan prioritas yang disengaja.
+# Daftar dibaca BARIS PER BARIS: satu GPU per entri, spasi di dalam nama GPU aman.
+# Dulu pakai `tr ',' ' '` + for, sehingga "NVIDIA GeForce RTX 4090" pecah jadi 4 GPU.
+GPU_SEMUA=$(printf '%s\n%s\n' "$GPU" "$GPU_CADANGAN" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$')
+URUTAN_TAMPIL=$(printf '%s' "$GPU_SEMUA" | paste -sd '>' -)
+catat "membuat pod dari template $TEMPLATE_ID di $DATA_CENTER (urutan GPU: $URUTAN_TAMPIL | cloud $CLOUD)"
+while IFS= read -r G; do
   LOG_POD="$KELUARAN_DIR/pod-$G.log"
   # Catatan: dengan --wait, runpodctl menulis progres ke stdout sebelum JSON,
   # jadi output-nya bukan JSON murni. Ambil berkasnya, bukan disangka JSON.
   set +e
+  T_MULAI=$(date +%s)
+  # --wait dijalankan DI BELAKANG (latar) supaya loop tetap bisa membaca log
+  # sambil berjalan: begitu id pod muncul, POD_ID langsung diisi. Kalau skrip
+  # dihentikan / --wait kena timeout, trap tetap tahu pod mana yang harus dihapus
+  # (dulu id baru dibaca sesudah loop, jadi pod yatim).
   runpodctl pod create --template-id "$TEMPLATE_ID" --gpu-id "$G" --gpu-count 1 \
         --cloud-type "$CLOUD" --container-disk-in-gb 30 --ports 22/tcp \
         --name "$NAMA" "${ARG_VOL[@]}" \
-        --wait --wait-for ssh --wait-timeout 8m -o json > "$LOG_POD" 2>&1
-  RC=$?
+        --wait --wait-for ssh --wait-timeout 8m -o json > "$LOG_POD" 2>&1 &
+  PID_TUNGGU=$!
+  while kill -0 "$PID_TUNGGU" 2>/dev/null; do
+    [ -z "$POD_ID" ] && POD_ID=$(sed -n 's/.*on pod \([a-z0-9]\{14\}\).*/\1/p' "$LOG_POD" 2>/dev/null | head -1)
+    sleep 1
+  done
+  wait "$PID_TUNGGU"; RC=$?
   set -e
   OUT=$(cat "$LOG_POD")
+  [ -z "$POD_ID" ] && POD_ID=$(printf '%s' "$OUT" | sed -n 's/.*on pod \([a-z0-9]\{14\}\).*/\1/p' | head -1)
   # --wait bisa keluar bukan-nol walau pod sudah jadi (mis. SSH telat). Kalau
   # wujud JSON berisi id, anggap berhasil — pod yang telanjur dibuat tetap
   # akan dihapus oleh trap.
@@ -109,26 +131,41 @@ for G in "$GPU" $(printf '%s' "$GPU_CADANGAN" | tr ',' ' '); do
     BISA=1; break
   fi
   catat "GPU $G gagal (rc=$RC): $(grep -vE '^\s*$' "$LOG_POD" | head -2 | tr '\n' ' ')"
-done
+done <<< "$GPU_SEMUA"
 [ "$BISA" = "1" ] || { catat "tidak ada GPU yang bisa dipakai"; exit 3; }
 
 # Buang baris progres "waiting for ssh ..." sebelum membaca JSON.
-JSON_POD=$(printf '%s' "$OUT" | python3 -c 'import sys;t=sys.stdin.read();i=t.find("{");print(t[i:] if i>=0 else "")')
-baca() { printf '%s' "$JSON_POD" | python3 -c "import json,sys;d=json.load(sys.stdin);print($1)"; }
-POD_ID=$(baca 'd.get("id") or ""')
+# JSON dari create boleh tidak lengkap (mis. keluar karena timeout), jadi ip/port
+# diambil ulang dari `pod get` — sumber yang sama, tapi utuh.
+POD_JSON=""
+for _ in 1 2 3 4 5 6; do
+  POD_JSON="$(runpodctl pod get "$POD_ID" -o json 2>/dev/null || true)"
+  printf '%s' "$POD_JSON" | grep -q '"ip"' && break
+  sleep 5
+done
+baca() { printf '%s' "$POD_JSON" | python3 -c "import json,sys;d=json.load(sys.stdin);print($1)"; }
 SSH_IP=$(baca '(d.get("ssh") or {}).get("ip") or ""')
 SSH_PORT=$(baca '(d.get("ssh") or {}).get("port") or ""')
 BIAYA=$(baca 'd.get("costPerHr")')
-catat "pod $POD_ID siap: root@$SSH_IP -p $SSH_PORT (\$$BIAYA/jam)"
-[ -n "$SSH_IP" ] && [ -n "$SSH_PORT" ] || { catat "info SSH kosong dari API"; exit 4; }
+GPU_DIPAKAI=$(baca 'd.get("gpuId") or ""')
+catat "pod $POD_ID siap (GPU $GPU_DIPAKAI, \$$BIAYA/jam): root@$SSH_IP -p $SSH_PORT"
+[ -n "$SSH_IP" ] && [ -n "$SSH_PORT" ] || { catat "info SSH kosong dari API — pod $POD_ID tetap akan dihapus oleh trap"; exit 4; }
 
 SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
      -o ServerAliveInterval=20 -o ServerAliveCountMax=6 -i "$KUNCI" -p "$SSH_PORT" "root@$SSH_IP")
 SCP=(scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KUNCI" -P "$SSH_PORT")
 
 # --- 2. verifikasi image, bukan asumsi ---
+SELISIH=$(( $(date +%s) - T_MULAI ))
 catat "verifikasi image di pod"
-"${SSH[@]}" 'echo "node: $(node -v)"; echo "remotion: $(remotion --version 2>/dev/null || echo TIDAK-ADA)"; echo "render-gpu: $(test -x /usr/local/bin/render-gpu && echo ADA || echo TIDAK-ADA)"; echo "chrome: $(ls /opt/chrome/.remotion/chrome-headless-shell/*/*/chrome-headless-shell 2>/dev/null || echo TIDAK-ADA)"' | tee -a "$LOG"
+# Waktu tunggu image + boot tercatat di sini; host yang lambat/bermasalah
+# kelihatan dari angka ini (rujukan: ±20-60 dtk; pernah 4+ menit).
+catat "pod siap ${SELISIH:-?} dtk setelah perintah create (image pull + boot)"
+# `remotion --version` mencetak teks bantuan CLI (bukan nomor versi); versi paket
+# dibaca dari package.json di node_modules.
+# Catatan: di pod tanpa proyek ter-install, versi remotion proyek = TIDAK-ADA (wajar);
+# yang membuktikan image sehat adalah node, render-gpu, dan chrome.
+"${SSH[@]}" 'echo "node: $(node -v)"; echo "remotion (proyek): $(node -p "require('\''remotion/package.json'\'').version" 2>/dev/null || echo BELUM-ADA)"; echo "render-gpu: $(test -x /usr/local/bin/render-gpu && echo ADA || echo TIDAK-ADA)"; echo "chrome: $(ls /opt/chrome/.remotion/chrome-headless-shell/*/*/chrome-headless-shell 2>/dev/null || echo TIDAK-ADA)"' | tee -a "$LOG"
 
 # --- 3. kirim proyek (tanpa node_modules/.git/out, karena bisa ratusan MB) ---
 SISI=/root/kerja

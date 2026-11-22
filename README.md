@@ -10,7 +10,9 @@ Repo ini berisi satu hal: **image Docker GPU yang siap render Remotion di pod Ru
 ├── ci-smoke-test.sh              # dipakai CI: uji isi image + render 5 frame
 ├── ci-durasi30.sh                # dipakai CI: render 30 detik (900 frame) 1920x1080
 ├── .dockerignore
-├── .hadolint.yaml
+├── ├── render-pod.sh                  # siklus penuh: pod → kirim → install → render → tarik → hapus
+├── PANDUAN-RENDER-POD.md          # panduan pemakaian (GPU, biaya, cache, jebakan)
+.hadolint.yaml
 └── .github/
     └── workflows/
         └── build-runpod-remotion.yml
@@ -62,6 +64,17 @@ Saran: pin ke `sha-...` atau tag versi, bukan `latest` — kalau CI menimpa `lat
 cd /workspace/proyek-kamu
 render-gpu src/index.ts MainComp out/video.mp4
 ```
+
+Siklus dari mesin lokal (buat pod → kirim proyek → install → render → tarik → hapus pod):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/budhis/remotion-runpod-gpu/main/render-pod.sh -o ~/render-pod.sh
+chmod +x ~/render-pod.sh
+~/render-pod.sh <direktori-proyek> src/index.tsx MainComp
+```
+
+GPU dicoba berurutan sesuai prioritas; bawaan mulai dari yang paling murah (lihat
+`PANDUAN-RENDER-POD.md` bagian 3). Atur sendiri mis. `GPU="NVIDIA GeForce RTX 4090,NVIDIA L4"`.
 
 `render-gpu` = `remotion render` dengan `--gl=swangle` (backend yang terbukti jalan di pod headless; `--gl=angle` gagal inisialisasi Vulkan/EGL tanpa display), ditambah pembuatan folder keluaran, cek entry, dan info GPU.
 
